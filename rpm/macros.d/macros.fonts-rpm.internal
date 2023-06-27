@@ -1,0 +1,183 @@
+# Copyright © 2018-2019 Nicolas Mailhot <nim@fedoraproject.org>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# RPM macros for fonts packages
+#
+# Internal utility macros
+# Direct use in spec file is not supported
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+%__fontbuild() %{expand:
+(
+  %define listfiles_include %{?currentfonts}
+  %define listfiles_exclude %{?currentfontsex}
+  IFS= lines=$(%listfiles
+  )
+  while IFS= read -r line; do
+    [[ -n $line ]] && fonts+=("$line")
+  done <<< ${lines}
+  fontnames=$(
+    if [ ${#fonts[@]} -gt 0 ]; then
+      for font in "${fonts[@]}"; do
+        fc-scan "${font}" -f "    <font>%{fullname[0]}</font>\\n"
+      done
+    fi | sort -u
+  )
+  if [[ -n "${fontnames}" ]] ; then
+    fontnames=$'\\n'"  <provides>"$'\\n'"${fontnames}"$'\\n'"  </provides>"
+  fi
+  fontlangs=$(
+    if [ ${#fonts[@]} -gt 0 ]; then
+      for font in "${fonts[@]}"; do
+        fc-scan "${font}" -f "%{[]lang{    <lang>%{lang}</lang>\\n}}"
+      done
+    fi | sort -u
+  )
+  if [[ -n "${fontlangs}" ]] ; then
+    fontlangs=$'\\n'"  <languages>"$'\\n'"${fontlangs}"$'\\n'"  </languages>"
+  fi
+  %define listfiles_include %{?currentfontappstreams}
+  %define listfiles_exclude %{?currentfontappstreamsex}
+  IFS= lines=$(%listfiles
+  )
+  while IFS= read -r line; do
+    [[ -n $line ]] && fontappstreams+=("$lines")
+  done <<< ${lines}
+  if  [ ${#fontappstreams[@]} -eq 0 ]; then
+    echo "Generating the %{currentfontname} appstream file"
+    cat > "%{fontorg}.%{currentfontname}.metainfo.xml" << EOF_APPSTREAM
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<component type="font">
+  <id>%{fontorg}.%{currentfontname}</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>%{currentfontlicense}</project_license>
+  <name>%{currentfonthumanname}</name>
+  <summary><![CDATA[%{currentfontsummary}]]></summary>
+  <description>
+    %fonttxt2xml -v currentfontdescription
+  </description>
+  <update_contact>%{fontcontact}</update_contact>
+  %{?url:<url type="homepage">%{url}</url>}
+  <releases>
+    <release version="%{version}-%{release}" date="$(date -d @$SOURCE_DATE_EPOCH -u --rfc-3339=d)"/>
+  </releases>${fontnames}${fontlangs}
+</component>
+EOF_APPSTREAM
+  fi
+)
+}
+
+%__fontinstall() %{expand:
+echo "Installing %{currentfontname}"
+echo "" > "%{currentfontlist}"
+(
+  %define listfiles_include %{?currentfonts}
+  %define listfiles_exclude %{?currentfontsex}
+  IFS= lines=$(%listfiles
+  )
+  while IFS= read -r line; do
+    [[ -n $line ]] && fonts+=("$line")
+  done <<< ${lines}
+  if [ ${#fonts[@]} -gt 0 ]; then
+    install -m 0755 -vd "%{buildroot}%{currentfontdir}"
+    echo "%dir \\"%{currentfontdir}\\""                  >> "%{currentfontlist}"
+    for font in "${fonts[@]}"; do
+      install -m 0644 -vp "${font}" "%{buildroot}%{currentfontdir}"
+      echo \\"%{currentfontdir}/$(basename "${font}")\\" >> "%{currentfontlist}"
+    done
+  fi
+  %define listfiles_include %{?currentfontconfngs}
+  %define listfiles_exclude %{?currentfontngsex}
+  IFS= lines=$(%listfiles
+  )
+  while IFS= read -r line; do
+    [[ -n $line ]] && fontconfngs+=("$line")
+  done <<< ${lines}
+  IFS= lines=$(
+    if [ ${#fontconfngs[@]} -gt 0 ]; then
+      for fontconfng in "${fontconfngs[@]}"; do
+        gen-fontconf -x "${fontconfng}" -w -f "${fonts[@]}"
+      done
+    fi
+  )
+  while IFS= read -r line; do
+    [[ -n $line ]] && newfontconfs+=("$line")
+  done <<< ${lines}
+  %define listfiles_include %{?currentfontconfs}
+  %define listfiles_exclude %{?currentfontconfsex}
+  IFS= lines=$(%listfiles
+  )
+  while IFS= read -r line; do
+    [[ -n $line ]] && fontconfs+=("$line")
+  done <<< ${lines}
+  if [ ${#fontconfs[@]} -gt 0 ] || [ ${#newfontconfs[@]} -gt 0 ]; then
+    install -m 0755 -vd "%{buildroot}%{_fontconfig_templatedir}" \\
+                        "%{buildroot}%{_fontconfig_confdir}"
+  fi
+  for fontconf in "${fontconfs[@]}" "${newfontconfs[@]}"; do
+    if [[ -n $fontconf ]] ; then
+      install -m 0644 -vp "${fontconf}" "%{buildroot}%{_fontconfig_templatedir}"
+      echo \\"%{_fontconfig_templatedir}/$(basename "${fontconf}")\\"                  >> "%{currentfontlist}"
+      ln -vsr "%{buildroot}%{_fontconfig_templatedir}/$(basename "${fontconf}")" "%{buildroot}%{_fontconfig_confdir}"
+      echo "%config(noreplace)" \\"%{_fontconfig_confdir}/$(basename "${fontconf}")\\" >> "%{currentfontlist}"
+    fi
+  done
+)
+(
+  %define listfiles_include %{?currentfontappstreams}
+  %define listfiles_exclude %{?currentfontappstreamsex}
+  IFS= lines=$(%listfiles
+  )
+  while IFS= read -r line; do
+    [[ -n $line ]] && fontappstreams+=("$line")
+  done <<< ${lines}
+  if [[ (${#fontappstreams[@]} -eq 0) && (-r "%{fontorg}.%{currentfontname}.metainfo.xml") ]] ; then
+    fontappstreams+=("%{fontorg}.%{currentfontname}.metainfo.xml")
+  fi
+  if [ ${#fontappstreams[@]} -gt 0 ] ; then
+    install -m 0755 -vd "%{buildroot}%{_metainfodir}"
+    for fontappstream in "${fontappstreams[@]}"; do
+      install -m 0644 -vp "${fontappstream}" "%{buildroot}%{_metainfodir}"
+      echo \\"%{_metainfodir}/$(basename "${fontappstream}")\\" >> "%{currentfontlist}"
+    done
+  fi
+)
+(
+  %define listfiles_include %{?currentfontdocs}
+  %define listfiles_exclude %{?currentfontdocsex}
+  IFS= lines=$(%listfiles
+  )
+  while IFS= read -r line; do
+    [[ -n $line ]] && fontdocs+=("$line")
+  done <<< ${lines}
+  for fontdoc in "${fontdocs[@]}"; do
+    echo %doc \\"${fontdoc}\\" >> "%{currentfontlist}"
+  done
+)
+(
+  %define listfiles_include %{?currentfontlicenses}
+  %define listfiles_exclude %{?currentfontlicensesex}
+  IFS= lines=$(%listfiles
+  )
+  while IFS= read -r line; do
+    [[ -n $line ]] && fontlicenses+=("$line")
+  done <<< ${lines}
+  for fontlicense in "${fontlicenses[@]}"; do
+    echo "%"license \\"${fontlicense}\\" >> "%{currentfontlist}"
+  done
+)
+}
