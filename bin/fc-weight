@@ -1,0 +1,57 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+import argparse
+
+parser = argparse.ArgumentParser(
+           description='Convert from and to the non standard fontconfig weight scale')
+cgroup = parser.add_mutually_exclusive_group(required=True)
+cgroup.add_argument("-t", "--to", action="store_true",
+                     help="Convert to fontconfig scale")
+cgroup.add_argument("-f", "--from", action="store_true",
+                     help="Convert from fontconfig scale")
+parser.add_argument("weight", metavar="WEIGHT", type=int, nargs=1,
+                     help="The weight to convert")
+args = parser.parse_intermixed_args()
+
+weights = { 'Thin':       { 'ot':  100, 'fc':   0 },
+            'ExtraLight': { 'ot':  200, 'fc':  40 },
+            'Light':      { 'ot':  300, 'fc':  50 },
+            'SemiLight':  { 'ot':  350, 'fc':  55 },
+            'Book':       { 'ot':  380, 'fc':  75 },
+            'Regular':    { 'ot':  400, 'fc':  80 },
+            'Medium':     { 'ot':  500, 'fc': 100 },
+            'SemiBold':   { 'ot':  600, 'fc': 180 },
+            'Bold':       { 'ot':  700, 'fc': 200 },
+            'ExtraBold':  { 'ot':  800, 'fc': 205 },
+            'Black':      { 'ot':  900, 'fc': 210 },
+            'ExtraBlack': { 'ot': 1000, 'fc': 215 } }
+
+def remap(weight, scale):
+  steps = sorted([ k for k in scale ])
+
+  if weight < steps[0]:
+    return scale[steps[0]]
+
+  if weight > steps[-1]:
+    return scale[steps[-1]]
+
+  for i, step in enumerate(steps):
+    if weight == step:
+      return scale[step]
+    if weight < step:
+      return round(scale[steps[i-1]] + (weight-steps[i-1]) * (scale[steps[i]]-scale[steps[i-1]]) / (steps[i]-steps[i-1]))
+
+def ot2fc(weight):
+  scale = { weights[step]['ot'] : weights[step]['fc'] for step in weights }
+  return remap(weight, scale)
+
+def fc2ot(weight):
+  scale = { weights[step]['fc'] : weights[step]['ot'] for step in weights }
+  return remap(weight, scale)
+
+if args.to:
+  print(ot2fc(args.weight[0]))
+
+else:
+  print(fc2ot(args.weight[0]))

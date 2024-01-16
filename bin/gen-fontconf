@@ -1,0 +1,720 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# An experimetal fontconfig configuration generator that simulates the syntax
+# requested in:
+# https://gitlab.freedesktop.org/fontconfig/fontconfig/issues/200
+#
+# It’s a simulation; it won’t ever achieve everything the requested syntax
+# should achieve (including, side-effect safety).
+#
+# The generator is experimental exploratory undocumented bad code that may
+# change behaviour or be removed altogether without prior notice, depending on
+# changes in the fontconfig request.
+#
+# DO NOT USE IT if you can’t deal with that situation
+
+import argparse
+from collections import OrderedDict
+import copy
+import csv
+import io
+from lxml import etree
+from operator import itemgetter
+import os
+from pathlib import PurePath
+import ruamel.yaml
+import subprocess
+import sys
+
+generics = [ 'sans-serif','serif','monospace','fantasy','cursive' ]
+
+oneormore = ['fullname', 'family', 'style',
+             'keyword', 'no-keyword', 'prune-keyword', 'prepend-keyword',
+             'good-lang', 'bad-lang']
+
+parser = argparse.ArgumentParser(
+           description='Generate traditional fontconfig syntax from a high-level configuration file')
+cgroup = parser.add_mutually_exclusive_group(required=True)
+cgroup.add_argument("-y", "--yaml", "-c", "--config", type=str,
+                    help="YAML configuration file to process")
+cgroup.add_argument("-x", "--xml", type=str,
+                    help="XML configuration file to process")
+parser.add_argument("-l", "--license", metavar="SPDX ID", type=str, nargs='?', default="MIT",
+                     help="SPDX license identifier for the generated files")
+parser.add_argument("-m", "--mode", metavar="MODE", type=str, nargs='?',
+                     default="legacy",  choices=['xml', 'yaml', 'legacy'],
+                     help="Output format: current fontconfig syntax, or XML/YAML syntax proposals")
+parser.add_argument("-w", "--write", action="store_true",
+                     help="Write output to disk")
+parser.add_argument("-o", "--output", metavar="OUTPUT FILE", type=str, nargs='?',
+                     help="Write output to file")
+parser.add_argument("-f", "--file", action="store_true",
+                     help="Return the written filename")
+parser.add_argument("paths", metavar="FONT PATH", type=str, nargs='*', default=[ "." ],
+                     help="A filesystem path containing font files")
+args = parser.parse_intermixed_args()
+
+def plural(tag):
+  plurals = { 'family': 'families' }
+  if tag in plurals:
+    return plurals[tag]
+  else:
+    return tag + 's'
+
+def yaml2match(gr):
+  match = { }
+  for r in gr:
+    if r in oneormore:
+      try:
+        match[plural(r)].append(gr[r])
+      except KeyError:
+        match[plural(r)] = [ gr[r] ]
+    elif r in [ plural(r) for r in oneormore ]:
+      if not isinstance(gr[r], list):
+        gr[r] = [ gr[r] ]
+      try:
+        match[r] = match[r] + gr[r]
+      except KeyError:
+        match[r] = gr[r]
+    else:
+      match[r] = gr[r]
+  return match
+
+def readyaml(yamlconfig):
+  yaml = ruamel.yaml.YAML(typ='safe')
+  configfile = open(yamlconfig, "r")
+  config = yaml.load(configfile)
+  configfile.close()
+
+  groups = OrderedDict()
+
+  for gs in config:
+    for g, grs in gs.items():
+      try:
+        group = groups[g]
+      except KeyError:
+        group = {}
+      generic = False
+      for gr in grs:
+        if gr == 'generic':
+          group['generic'] = True
+        elif 'like' in gr:
+          for family in gr['like']:
+            try:
+              family = family['family']
+            except:
+              pass
+            try:
+              if family not in group['like']:
+                group['like'].append(family)
+            except KeyError:
+              group['like'] = [ family ]
+        elif 'axes' in gr:
+          try:
+            axes = group['axes']
+          except KeyError:
+            axes = {}
+          for aa in gr['axes']:
+            for a, steps in aa.items():
+              try:
+                axis = axes[a]
+              except KeyError:
+                axis = {}
+              if isinstance(steps,dict):
+                for step, value in steps.items():
+                  try:
+                    axis[step]['value'] = value
+                  except KeyError:
+                    axis[step] = { 'value' : value }
+              else:
+                for ss in steps:
+                  for s, sk in ss.items():
+                    try:
+                      step = axis[s]
+                    except KeyError:
+                      step = {}
+                    try:
+                      for k in sk:
+                        if isinstance(k, dict):
+                          try:
+                            step['matches'].append(yaml2match(k))
+                          except KeyError:
+                            step['matches'] = [ yaml2match(k) ]
+                        else:
+                          step['value'] = k
+                    except TypeError:
+                      step['value'] = sk
+                    axis[s] = step
+              axes[a] = axis
+            group['axes'] = axes
+        else:
+          try:
+            group['axes']['optical size']['Regular']['matches'].append(yaml2match(gr))
+          except KeyError:
+            group_d = { 'axes': { 'optical size': { 'Regular': { 'matches': [ yaml2match(gr) ] } } } }
+            dictfill(group, group_d)
+      groups[g] = group
+  return groups
+
+def xml2match(element):
+  match = { }
+  if element.tag == 'family':
+    match[plural('family')] = [ element.text ]
+  elif element.tag == 'match':
+    for rule in element:
+      if rule.tag in oneormore:
+        try:
+          match[plural(rule.tag)].append(rule.text)
+        except KeyError:
+          match[plural(rule.tag)] = [ rule.text ]
+      elif rule.tag in [ plural(p) for p in oneormore ]:
+        for subrule in rule:
+          if subrule.tag == rule.tag:
+            try:
+              match[rule.tag].append(subrule.text)
+            except KeyError:
+              match[rule.tag] = [ subrule.text ]
+      elif rule.tag == 'change':
+        k = rule.find('style').text
+        v = rule.find('into').text
+        try:
+          match['new-styles'][k] = v
+        except KeyError:
+          match['new-styles'] = { k : v }
+      else:
+        match[rule.tag] = rule.text
+  if len(match) > 0:
+    return match
+
+def readxml(xmlconfig):
+  tree = etree.parse(xmlconfig)
+  root = tree.getroot()
+  if root.tag == 'fontconfig':
+    groups = OrderedDict()
+    for group in root.findall('group'):
+      name = ''
+      try:
+        name = group.find('generic').text
+        groups[name] = { generic: True }
+      except AttributeError:
+        try:
+          name = group.find('target').text
+          groups[name] = {}
+        except AttributeError:
+          print("Warning: anonymous group", file=sys.stderr)
+      if name != '':
+        for child in group:
+          if child.tag == 'axis':
+            axis = child.find('name').text
+            steps = { }
+            for step in child:
+              if step.tag == 'step':
+                s = {}
+                n = step.find('name').text
+                for r in step:
+                  if r.tag == 'value':
+                    s['value'] = float(r.text)
+                  elif r.tag in ('family','match'):
+                    try:
+                      s['matches'].append(xml2match(r))
+                    except KeyError:
+                      s['matches'] = [ xml2match(r) ]
+                steps[n] = s
+            try:
+              groups[name]['axes'][axis] = steps
+            except KeyError:
+              groups[name]['axes'] = { axis : steps }
+          elif child.tag == 'like':
+            for family in child.findall('family'):
+              try:
+                groups[name]['like'].append(family.text)
+              except KeyError:
+                groups[name]['like'] = [ family.text ]
+          elif child.tag in ('family','match'):
+            try:
+              groups[name]['axes']['optical size']['Regular']['matches'].append(xml2match(child))
+            except KeyError:
+              group_d = { 'axes': { 'optical size': { 'Regular': { 'matches': [ xml2match(child) ] } } } }
+              dictfill(groups[name], group_d)
+    return groups
+
+def scanfonts(paths):
+  fonts = {}
+  fields = [ 'family', 'style', 'fullname', 'slant', 'weight', 'width', 'fontversion', 'lang', 'file' ]
+  scans = []
+  for field in fields:
+    scans.append('%{' + field + '}')
+  sep = "\u001E"
+  scanline = sep.join(scans) + '\\n'
+  fc_env = os.environ.copy()
+  fc_env["FONTCONFIG_SYSROOT"] = "/dev/null"
+  with subprocess.Popen(
+         [ 'fc-scan', '-f', scanline ] + paths,
+         env=fc_env,
+         stdout=subprocess.PIPE,
+         stderr=subprocess.PIPE,
+         universal_newlines=True) as p:
+    reader = csv.DictReader(p.stdout, delimiter="\u001E", fieldnames = fields)
+    for font in reader:
+      for field in ('family', 'style', 'fullname'):
+        font[field] = font[field].split(',')
+      font['lang'] = font['lang'].split('|')
+      fid = (font['family'][0],font['style'][0],font['fullname'][0],font['file'])
+      fonts[fid] = font
+  return fonts
+
+def fillmatch(default, qualifier, match):
+  if all( plural(k) not in match or len(match[plural(k)]) == 0
+          for k in ('fullname', 'family') ):
+    m = copy.deepcopy(match)
+    if qualifier:
+      m[plural('family')] = [ " ".join([default, qualifier]) ]
+    else:
+      m[plural('family')] = [ default ]
+  else:
+    m = match
+  return m
+
+def fontmatches(default, qualifier, match, font):
+  m = fillmatch(default, qualifier, match)
+  name_mismatch = any( plural(k) in m and font[k][0] not in m[plural(k)]
+                        for k in ('fullname', 'family', 'style') )
+  keyword_mismatch = ( plural('keyword') in m and
+                       set(m[plural('keyword')]).isdisjoint(str.split(font['style'][0])) )
+  no_keyword_mismatch = ( plural('no-keyword') in m and
+                          not set(m[plural('no-keyword')]).isdisjoint(str.split(font['style'][0])) )
+  return not ( name_mismatch or keyword_mismatch or no_keyword_mismatch )
+
+def nameclean(name):
+  return " ".join(str.split(name.replace('_',' ')))
+
+def newvalues(group, qualifier, match, axes, style):
+  n = {}
+  try:
+    n['family'] = " ".join([ group, qualifier ])
+  except TypeError:
+    n['family'] = group
+  n['family'] = nameclean(n['family'])
+  n['style'] = style
+  if n['style'] != '':
+    if 'new-styles' in match and n['style'] in match['new-styles']:
+      n['style'] = match['new-styles'][n['style']]
+    keywords = str.split(nameclean(n['style']))
+    pks = []
+    if qualifier:
+      pks.append(qualifier)
+    if plural('prune-keyword') in match:
+      pks = pks + match[plural('prune-keyword')]
+    keywords = [ k for k in keywords if k not in pks ]
+    if plural('prepend-keyword') in match:
+      keywords = match[plural('prepend-keyword')] + keywords
+    aliases = { k:step for axis in [ 'width', 'weight', 'slant' ]
+                         if axis in axes
+                       for step in axes[axis]
+                         if 'matches' in axes[axis][step]
+                       for m in axes[axis][step]['matches']
+                         if plural('keyword') in m
+                       for k in m[plural('keyword')] }
+    keywords = [ (lambda k: aliases[k] if k in aliases else k)(k)
+                    for k in keywords ]
+    keywords = [ k for k in keywords
+                     if k != 'Regular' ]
+    decoded = []
+    allvalues = True
+    for axis in ['width','weight','slant']:
+      if axis in axes:
+        for step in axes[axis]:
+          if step in keywords:
+            decoded.append(step)
+            if 'value' in axes[axis][step]:
+              n[axis] = axes[axis][step]['value']
+            else:
+              allvalues = False
+            break
+    if len(decoded) == len(keywords):
+      keywords = decoded
+      if len(decoded) < 3 and allvalues:
+        for axis in ['slant','weight','width']:
+          if axis not in n:
+            try:
+              n[axis] = axes[axis]['Regular']['value']
+            except KeyError:
+              pass
+    n['style'] = " ".join(keywords)
+    if n['style'] == '':
+      n['style'] = 'Regular'
+  return n
+
+def blindeditors(group, qualifier, match, axes):
+  editors = []
+  m = fillmatch(group, qualifier, match)
+  if plural('style') in m:
+    editors += [ blindeditor(group, qualifier, m, axes, m[plural('style')][0]) ]
+  else:
+    styles = []
+    if 'new-styles' in m:
+      styles = [ s for s in m['new-styles'] ]
+    for style in styles:
+      editors += [ blindeditor(group, qualifier, m, axes, style) ]
+    if len(styles) == 0:
+      editors += [ blindeditor(group, qualifier, m, axes, '') ]
+  return editors
+
+def blindeditor(group, qualifier, match, axes, style):
+  n = newvalues(group, qualifier, match, axes, style)
+  if style != '':
+    if n['style'] == 'Regular':
+      n['fullname'] = n['family']
+    else:
+      n['fullname'] = n['family'] + " " + n['style']
+  matches = []
+  for k in ['fullname','family','style']:
+    if plural(k) in match:
+      for v in match[plural(k)]:
+        t = etree.Element('test', name = k)
+        s = etree.SubElement(t, 'string')
+        s.text = v
+        matches.append(t)
+  edits = []
+  for k in [ 'fullname', 'family', 'style', 'slant', 'weight', 'width' ]:
+    if  (k in n and
+       ((k != 'style' ) or
+        (k == 'style' and n[k] != style and style != '' ))):
+      S = 'string'
+      if k in ('weight', 'width', 'slant'):
+        S = 'double'
+      t = etree.Element('edit', name = k)
+      if k in ('fullname', 'family', 'style'):
+        t.set("mode", "prepend")
+      s = etree.SubElement(t, S)
+      s.text = str(n[k])
+      edits.append(t)
+  editor = etree.Element('match', target='scan')
+  editor.append(etree.Comment('Blind match, some rewriting may be incomplete'))
+  children = matches + edits
+  for child in children :
+    editor.append(child)
+  return editor
+
+def geneditor(group, qualifier, match, axes, font):
+  n = newvalues(group, qualifier, match, axes, font['style'][0])
+  if n['style'] == '':
+    n['fullname'] = ''
+  elif n['style'] == 'Regular':
+    n['fullname'] = n['family']
+  else:
+    n['fullname'] = n['family'] + " " + n['style']
+  matches = []
+  for k in ['fullname','family','style']:
+    if font[k][0] != '':
+      t = etree.Element('test', name = k)
+      s = etree.SubElement(t, 'string')
+      s.text = font[k][0]
+      matches.append(t)
+  edits = []
+  for k in [ 'fullname', 'family', 'style', 'slant', 'weight', 'width' ]:
+    if  (k in n and
+       ((k in ('fullname', 'family') and n[k] != font[k][0]) or
+        (k == 'style' and n[k] != font[k][0] and font[k][0] != '' ) or
+        (k in ('slant', 'weight', 'width') and n[k] != float(font[k].replace(',','.'))))):
+      S = 'string'
+      if k in ('weight', 'width', 'slant'):
+        S = 'double'
+      t = etree.Element('edit', name = k)
+      if k in ('fullname', 'family', 'style'):
+        t.set("mode", "prepend")
+      if k in ('slant', 'weight', 'width'):
+        t.append(etree.Comment(' original ' + k + ' value: ' + font[k] + ' '))
+      s = etree.SubElement(t, S)
+      s.text = str(n[k])
+      edits.append(t)
+  if 'good-langs' in match and len(match['good-langs']) > 0:
+    minuses = []
+    for lang in [ l for l in font['lang'] if l not in match['good-langs']]:
+      minuses.append(lang)
+    if len(minuses) > 0:
+      edit = etree.Element('edit', name="lang", mode="assign")
+      minus = etree.SubElement(edit, 'minus')
+      name = etree.SubElement(minus, 'name')
+      name.text = 'lang'
+      langset = etree.SubElement(minus, 'langset')
+      for lang in minuses:
+        s = etree.SubElement(langset, 'string')
+        s.text = lang
+      edits.append(edit)
+  editor = etree.Element('match', target='scan')
+  children = matches + edits
+  for child in children :
+    editor.append(child)
+  return editor, len(edits)
+
+def geneditors(group, qualifier, step, axes, fonts):
+  editors = []
+  try:
+    for match in step['matches']:
+      changers, matchers = matchfonts(group, qualifier, match, axes, fonts)
+      l = len(changers) + len(matchers)
+      if l == 0:
+        changers = blindeditors(group, qualifier, match, axes)
+      editors += [ (changers, matchers) ]
+  except KeyError:
+    pass
+  self_changers, self_matchers = matchfonts(group, qualifier, {}, axes, fonts)
+  edl = []
+  if len(editors) == 0:
+    if len(self_changers) > 0:
+      edl = [ self_changers ]
+  elif len(editors) == 1 and len(self_changers) == 0 and len(self_matchers) == 0:
+    edl = [ editors[0][0] ]
+  else:
+    edl = []
+    L = self_changers + self_matchers
+    if len(L) > 0:
+      edl.append(L)
+    for l in editors:
+      L = l[0] + l[1]
+      if len(L) > 0:
+        edl.append(L)
+  p = len(edl)
+  if p > 1:
+    for l in edl:
+      addversion(l, p)
+      p -= 1
+  return [ e for l in edl for e in l ]
+
+def matchfonts(group, qualifier, match, axes, fonts):
+  changers = []
+  matchers = []
+  for fid in list(fonts.keys()):
+    font = fonts[fid]
+    if fontmatches(group, qualifier, match, font):
+      e, c = geneditor(group, qualifier, match, axes, font)
+      if e != None:
+        if c > 0:
+          changers.append(e)
+        else:
+          matchers.append(e)
+      else:
+        print("Warning: no editor generated after matching font pattern!", file=sys.stderr)
+      del fonts[fid]
+  return changers, matchers
+
+def addversion(editors, version):
+  for editor in editors:
+    t = etree.SubElement(editor, 'edit', name = 'fontversion')
+    s = etree.SubElement(t,'int')
+    s.text = str(version)
+
+def alias(family, aliases):
+  alias = etree.Element('alias', binding="same")
+  f = etree.SubElement(alias, 'family')
+  f.text = family
+  A = etree.SubElement(alias, 'accept')
+  for like in aliases:
+    F = etree.SubElement(A, 'family')
+    F.text = like
+  return alias
+
+def genlikes(group, likes):
+  aliases = []
+  aliases.append(alias(group, likes))
+  for family in likes:
+    if family not in generics:
+      aliases.append(alias(family,[group]))
+    else:
+      a = etree.Element('alias')
+      f = etree.SubElement(a, 'family')
+      f.text = family
+      p = etree.SubElement(a, 'prefer')
+      F =  etree.SubElement(p, 'family')
+      F.text = group
+      aliases.append(a)
+  return aliases
+
+def dictfill(d, default):
+  for k in default:
+    if k not in d:
+      d[k] = default[k]
+    else:
+      if isinstance(d[k],dict):
+        dictfill(d[k], default[k])
+
+def writelegacy(groups, fonts, license):
+  tree = etree.parse(io.StringIO(u"""<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<!-- SPDX-License-Identifier: """ + license + """ -->
+<fontconfig/>"""))
+  root = tree.getroot()
+  for group, rules in groups.items():
+    axes_d = { 'optical size': { 'Regular': { 'value':  11 } },
+               'width':        { 'Regular': { 'value': 100 } },
+               'slant':        { 'Regular': { 'value':   0 },
+                                 'Italic':  { 'value': 100 } } }
+    try:
+      axes = rules['axes']
+      dictfill(axes,axes_d)
+    except KeyError:
+      axes = axes_d
+    steps = axes['optical size']
+    step = steps['Regular']
+    z = step['value']
+    els = []
+    if 'like' in rules and len(rules['like']) > 0:
+      els += genlikes(group, rules['like'])
+    sns = [ sn for sn,_ in sorted(steps.items(),
+                                  key = lambda step: step[1]['value']
+                                  if 'value' in step[1] else 0)
+            if sn != 'Regular' ]
+    for sn in sns:
+      step = steps[sn]
+      v = step['value']
+      i = sns.index(sn)
+      if v < z:
+        if i > 0:
+          step['more'] = steps[sns[i-1]]['value']
+        step['less'] = v
+      elif v > z:
+        if i < (len(sns) -1):
+          step['less'] = steps[sns[i+1]]['value']
+        step['more'] = v
+      els += geneditors(group, sn, step, axes, fonts)
+      m = etree.Element('match')
+      t = etree.SubElement(m, 'test', name='family')
+      S = etree.SubElement(t, 'string')
+      S.text = nameclean(group)
+      for op in ('more','less'):
+        if op in step:
+          opn = op
+          if step[op] == v:
+            opn = opn + '_eq'
+          t = etree.SubElement(m, 'test', name = 'size', compare = opn)
+          D = etree.SubElement(t, 'double')
+          D.text = str(step[op])
+      e = etree.SubElement(m, 'edit', name = 'family', mode = 'prepend', binding='same')
+      S = etree.SubElement(e, 'string')
+      sgroup = nameclean(" ".join([group,sn]))
+      S.text = sgroup
+      els.append(m)
+      els += genlikes(sgroup, [ group ])
+    els = geneditors(group, None, axes['optical size']['Regular'], axes, fonts) + els
+  for el in els:
+    root.append(el)
+  if len(fonts) > 0:
+    print("Warning: patterns found in scan, ignored by configuration:", file=sys.stderr)
+    for fid,font in fonts.items():
+      print(font, file=sys.stderr)
+  return tree
+
+def xmlmatch(match):
+  if len(match) == 1 and plural('family') in match and len(match[plural('family')]) == 1:
+    f = etree.Element('family')
+    f.text = match[plural('family')][0]
+    return f
+  elif len(match) > 0:
+    m = etree.Element('match')
+    for k in oneormore:
+      l = []
+      if k in match:
+        l.append(str(match[k]))
+      ks = plural(k)
+      if ks in match:
+        l = l + match[ks]
+      for i in sorted(set(l)):
+        I = etree.SubElement(m, k)
+        I.text = i
+    if 'new-styles' in match:
+      for style in sorted(match['new-styles']):
+        c = etree.SubElement(m, 'change')
+        S = etree.SubElement(c, 'style')
+        S.text = style
+        NS = etree.SubElement(c, 'into')
+        NS.text = match['new-styles'][style]
+    return m
+
+def writexml(groups,license):
+  tree = etree.parse(io.StringIO(u"""<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<!-- SPDX-License-Identifier: """ + license + """ -->
+<fontconfig/>"""))
+  root = tree.getroot()
+  for group, rules in groups.items():
+    g = etree.SubElement(root, 'group')
+    if 'generic' in rules:
+      G = etree.SubElement(g, 'generic')
+      G.text = group
+    else:
+      T = etree.SubElement(g, 'target')
+      T.text = group
+  if 'axes' in rules:
+    optical = True
+    try:
+      if set(rules['axes']['optical size'].keys()) == {'Regular'}:
+        optical = False
+        for match in rules['axes']['optical size']['Regular']['matches']:
+          g.append(xmlmatch(match))
+    except KeyError:
+      pass
+    for axis in [ a for a in sorted(rules['axes'])
+                  if a != 'optical size' or optical ]:
+      a = etree.SubElement(g, 'axis')
+      n = etree.SubElement(a, 'name')
+      n.text = axis
+      for stepkey in {s: v for s,v in sorted(rules['axes'][axis].items(),
+                                             key = lambda step: step[1]['value']
+                                             if 'value' in step[1] else 0)}:
+        step = rules['axes'][axis][stepkey]
+        s = etree.SubElement(a, 'step')
+        N = etree.SubElement(s, 'name')
+        N.text = stepkey
+        if 'value' in step:
+          v = etree.SubElement(s, 'value')
+          v.text = str(step['value'])
+        if 'matches' in step:
+          for match in step['matches']:
+            s.append(xmlmatch(match))
+  if 'like' in rules and len(rules['like']) > 0:
+    l = etree.SubElement(g, 'like')
+    for family in rules['like']:
+      f = etree.SubElement(l, 'family')
+      f.text = family
+  return tree
+
+output = args.output
+ext = '.conf'
+if args.mode == 'xml':
+  ext = '.xml'
+
+if args.yaml != None:
+  groups = readyaml(args.yaml)
+  if args.write and output == None:
+    output = PurePath(PurePath(args.yaml).name).with_suffix(ext)
+elif args.xml != None:
+  groups = readxml(args.xml)
+  if args.write and output == None:
+    output = PurePath(PurePath(args.xml).name).with_suffix(ext)
+
+if output != None:
+  of = open(output, mode='w')
+else:
+  of = sys.stdout
+
+print("""
+gen-fontconf is an experimental utility, intended for stopgap use. It is
+neither supported nor stable. It will be abandoned and deprecated as soon as an
+equivalent syntax is added to fontconfig.
+See also: https://gitlab.freedesktop.org/fontconfig/fontconfig/issues/200
+""", file=sys.stderr)
+
+if args.mode == 'xml':
+  t = writexml(groups, args.license)
+  print(etree.tostring(t, pretty_print=True, encoding = 'UTF-8', xml_declaration=True).decode('utf-8'), file = of)
+else:
+  fonts = scanfonts(args.paths)
+  t = writelegacy(groups, fonts, args.license)
+  print(etree.tostring(t, pretty_print=True, encoding = 'UTF-8', xml_declaration=True).decode('utf-8'), file = of)
+
+if output != None:
+  if args.file:
+    print(output)
+  of.close()

@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT
+
+Fontconfig configuration file ordering
+
+Fontconfig parses files in /etc/fonts/conf.d/ by filename order. The following
+conventions are used to attibute the appropriate prefix to new files:
+
+┌────────┬────────────────────────────────────────────────────────────────────┐
+│ Prefix │ Description                                                        │
+├────────┼────────────────────────────────────────────────────────────────────┤
+│ 50     │ User override                                                      │
+│ 51     │ Local system overrides                                             │
+│ 55-59  │ High priority LGC (Latin Greek Cyrillic) fonts                     │
+│        │ (distribution general-purpose default fonts)                       │
+│ 60     │ Main LGC font list                                                 │
+│ 61-64  │ Low priority LGC fonts                                             │
+│ 65-69  │ Fonts with less common encodings, ending with fonts that provide   │
+│        │ coverage of exotic unicode blocks at the expense of drawing        │
+│        │ quality                                                            │
+└────────┴────────────────────────────────────────────────────────────────────┘
+
+Fontconfig uses an inverted priority scheme where files with lower-number
+prefixes take precedence over files with higher-number prefixes.
+
+It is almost always safe to use high numbers in the prefix range your font
+belongs to, if you do not want to perturb distribution defaults.
+
+See also /etc/fonts/conf.d/README
+
+© 2007-2009 Nicolas Mailhot <nim at fedoraproject dot org>
